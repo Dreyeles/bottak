@@ -192,6 +192,28 @@ def main():
     if eleccion.lower() in ["s", "salir"]:
         return
 
+    if eleccion.lower() == "t":
+        confirmar = input(f"\n{Fore.YELLOW}¿Deseas procesar los {len(archivos)} archivos mensuales en lote? (s/n): {Fore.RESET}").strip().lower()
+        if confirmar in ["s", "si", "y", "yes"]:
+            for num, arch in enumerate(archivos, start=1):
+                # Omitir archivos vacíos o de prueba muy pequeños
+                ruta_elegida = os.path.join(carpeta_chats, arch)
+                if os.path.getsize(ruta_elegida) < 1000:
+                    continue
+                print(f"\n{Fore.CYAN}{Style.BRIGHT}==========================================")
+                print(f"{Fore.YELLOW}PROCESANDO [{num}/{len(archivos)}]: {arch}")
+                print(f"{Fore.CYAN}{Style.BRIGHT}==========================================")
+                recuerdos = procesar_archivo_mes(ruta_elegida, cliente, modelo)
+                if recuerdos:
+                    guardar_en_contexto_md(recuerdos)
+
+            print(f"\n{Fore.GREEN}{Style.BRIGHT}✔ ¡Procesamiento en lote completado!")
+            subir = input(f"\n{Fore.YELLOW}¿Deseas subir automáticamente los nuevos recuerdos a GitHub para actualizar Render? (s/n): {Fore.RESET}").strip().lower()
+            if subir in ["s", "si", "y", "yes"]:
+                os.system('git add personajes/ada_liz_contexto.md && git commit -m "feat: Actualizada cronologia completa de recuerdos para Ada Liz" && git push origin main')
+                print(f"{Fore.GREEN}✔ ¡Cambios subidos a GitHub!")
+        return
+
     if eleccion.isdigit():
         idx = int(eleccion) - 1
         if 0 <= idx < len(archivos):
@@ -202,6 +224,10 @@ def main():
                 guardar = input(f"{Fore.GREEN}¿Deseas guardar estos recuerdos en ada_liz_contexto.md? (s/n): {Fore.RESET}").strip().lower()
                 if guardar in ["s", "si", "y", "yes"]:
                     guardar_en_contexto_md(recuerdos)
+                    subir = input(f"\n{Fore.YELLOW}¿Deseas subir los cambios a GitHub para actualizar Render? (s/n): {Fore.RESET}").strip().lower()
+                    if subir in ["s", "si", "y", "yes"]:
+                        os.system('git add personajes/ada_liz_contexto.md && git commit -m "feat: Actualizados recuerdos de chat para Ada Liz" && git push origin main')
+                        print(f"{Fore.GREEN}✔ ¡Cambios subidos a GitHub!")
             return
 
     print(f"{Fore.RED}Opción no válida.")
@@ -209,3 +235,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
