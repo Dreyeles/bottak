@@ -13,11 +13,38 @@ import sys
 import json
 import warnings
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Forzar flush de salida para ver logs de inmediato
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 warnings.filterwarnings("ignore", category=UserWarning, module="telegram")
+
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Servidor web ultraligero para que plataformas en la nube (como Render) sepan que el bot está vivo."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot de Rol Telegram activo y funcionando.")
+
+    def log_message(self, format, *args):
+        pass  # Silenciar logs del servidor web para no ensuciar la consola
+
+
+def iniciar_servidor_web_salud():
+    """Inicia el servidor web solo si la plataforma en la nube asigna una variable PORT."""
+    puerto_env = os.getenv("PORT")
+    if puerto_env:
+        try:
+            puerto = int(puerto_env)
+            servidor = HTTPServer(("0.0.0.0", puerto), HealthCheckHandler)
+            print(f"✔ Servidor de salud web iniciado en el puerto {puerto}")
+            servidor.serve_forever()
+        except Exception as e:
+            print(f"Aviso al iniciar servidor web de salud: {e}")
 from io import BytesIO
 from datetime import datetime
 from dotenv import load_dotenv
@@ -580,6 +607,11 @@ def main():
     print(f"✔ Proveedores de IA activos: {len(proveedores)}")
     for p in proveedores:
         print(f"  - {p['nombre']} ({p['modelo']})")
+
+    # Iniciar servidor web de salud en segundo plano si estamos en la nube (Render / Heroku / Koyeb)
+    if os.getenv("PORT"):
+        hilo_web = threading.Thread(target=iniciar_servidor_web_salud, daemon=True)
+        hilo_web.start()
 
     # Construir la aplicación de Telegram
     app = ApplicationBuilder().token(token_telegram).build()
