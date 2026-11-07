@@ -140,38 +140,48 @@ def inicializar_proveedores():
     return proveedores
 
 
+def cargar_personaje_completo(archivo):
+    """Carga un personaje desde su archivo JSON y fusiona su archivo .md complementario si existe."""
+    ruta = os.path.join(CARPETA_PERSONAJES, archivo)
+    if not os.path.exists(ruta):
+        return None
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        datos["_archivo"] = archivo
+        if isinstance(datos.get("system_prompt"), list):
+            datos["system_prompt"] = "\n".join(datos["system_prompt"])
+        if isinstance(datos.get("saludo_inicial"), list):
+            datos["saludo_inicial"] = "\n".join(datos["saludo_inicial"])
+
+        # Cargar archivo de contexto en Markdown complementario si existe
+        ruta_ctx_md = os.path.join(CARPETA_PERSONAJES, archivo.replace(".json", "_contexto.md"))
+        if os.path.exists(ruta_ctx_md):
+            try:
+                with open(ruta_ctx_md, "r", encoding="utf-8") as f_ctx:
+                    texto_ctx = f_ctx.read().strip()
+                    if texto_ctx:
+                        datos["system_prompt"] += f"\n\n=== MEMORIAS Y ANÉCDOTAS HISTÓRICAS DE WHATSAPP ===\n{texto_ctx}"
+            except Exception as e_ctx:
+                print(f"Aviso leyendo contexto .md de {archivo}: {e_ctx}")
+
+        return datos
+    except Exception as e:
+        print(f"Error cargando {archivo}: {e}")
+        return None
+
+
 def cargar_personajes():
-    """Carga los archivos JSON de la carpeta personajes/."""
+    """Carga todos los personajes disponibles."""
     personajes = []
     if not os.path.exists(CARPETA_PERSONAJES):
         return personajes
 
     for archivo in sorted(os.listdir(CARPETA_PERSONAJES)):
         if archivo.endswith(".json"):
-            ruta = os.path.join(CARPETA_PERSONAJES, archivo)
-            try:
-                with open(ruta, "r", encoding="utf-8") as f:
-                    datos = json.load(f)
-                    datos["_archivo"] = archivo
-                    if isinstance(datos.get("system_prompt"), list):
-                        datos["system_prompt"] = "\n".join(datos["system_prompt"])
-                    if isinstance(datos.get("saludo_inicial"), list):
-                        datos["saludo_inicial"] = "\n".join(datos["saludo_inicial"])
-
-                    # Cargar archivo de contexto en Markdown complementario si existe
-                    ruta_ctx_md = os.path.join(CARPETA_PERSONAJES, archivo.replace(".json", "_contexto.md"))
-                    if os.path.exists(ruta_ctx_md):
-                        try:
-                            with open(ruta_ctx_md, "r", encoding="utf-8") as f_ctx:
-                                texto_ctx = f_ctx.read().strip()
-                                if texto_ctx:
-                                    datos["system_prompt"] += f"\n\n=== CONTEXTO DETALLADO Y RECUERDOS (MARKDOWN) ===\n{texto_ctx}"
-                        except Exception as e_ctx:
-                            print(f"Aviso leyendo contexto .md de {archivo}: {e_ctx}")
-
-                    personajes.append(datos)
-            except Exception as e:
-                print(f"Error cargando {archivo}: {e}")
+            p = cargar_personaje_completo(archivo)
+            if p:
+                personajes.append(p)
     return personajes
 
 
@@ -430,17 +440,10 @@ async def callback_personaje(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     archivo = data.replace("sel_", "")
-    ruta = os.path.join(CARPETA_PERSONAJES, archivo)
+    datos_p = cargar_personaje_completo(archivo)
 
-    if not os.path.exists(ruta):
+    if not datos_p:
         await query.edit_message_text("❌ Personaje no encontrado.")
-        return
-
-    try:
-        with open(ruta, "r", encoding="utf-8") as f:
-            datos_p = json.load(f)
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error al cargar personaje: {e}")
         return
 
     chat_id = update.effective_chat.id
@@ -487,10 +490,22 @@ async def cmd_limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sesion = sesiones_usuarios[chat_id]
+    archivo = sesion["personaje"].get("_archivo", "")
+    if archivo:
+        datos_recargados = cargar_personaje_completo(archivo)
+        if datos_recargados:
+            sesion["personaje"] = datos_recargados
+
     datos_p = sesion["personaje"]
     nombre = datos_p.get("nombre", "Personaje")
     saludo = datos_p.get("saludo_inicial", f"*{nombre} te observa en silencio.*")
-    system_prompt = sesion["historial"][0]["content"]
+    nombre_jugador = sesion.get("nombre_jugador", "Aventurero")
+    prompt_base = datos_p.get("system_prompt", f"Eres {nombre}. Mantén siempre el rol.")
+
+    system_prompt = (
+        f"{prompt_base}\n"
+        f"El usuario interactúa contigo a través de Telegram bajo el nombre o personaje de '{nombre_jugador}'."
+    )
 
     sesion["historial"] = [
         {"role": "system", "content": system_prompt},
