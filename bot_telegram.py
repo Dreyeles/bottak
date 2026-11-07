@@ -11,6 +11,7 @@ y sistema de respaldo automático entre Groq y OpenRouter.
 import os
 import sys
 import json
+import time
 import warnings
 import asyncio
 import threading
@@ -113,6 +114,12 @@ def inicializar_proveedores():
             "temperatura": 0.8
         })
         proveedores.append({
+            "nombre": "Groq Cloud (GPT OSS 20B)",
+            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "modelo": "openai/gpt-oss-20b",
+            "temperatura": 0.8
+        })
+        proveedores.append({
             "nombre": "Groq Cloud (Qwen 27B)",
             "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
             "modelo": "qwen/qwen3.8-27b",
@@ -172,6 +179,9 @@ def cargar_personaje_completo(archivo):
                 with open(ruta_ctx_md, "r", encoding="utf-8") as f_ctx:
                     texto_ctx = f_ctx.read().strip()
                     if texto_ctx:
+                        # Limitar a máximo 15,000 caracteres para no exceder los límites de tokens por minuto (TPM)
+                        if len(texto_ctx) > 15000:
+                            texto_ctx = texto_ctx[:15000] + "\n\n... (recuerdos adicionales guardados en archivo)"
                         datos["system_prompt"] += f"\n\n=== MEMORIAS Y ANÉCDOTAS HISTÓRICAS DE WHATSAPP ===\n{texto_ctx}"
             except Exception as e_ctx:
                 print(f"Aviso leyendo contexto .md de {archivo}: {e_ctx}")
@@ -231,6 +241,23 @@ def _generar_respuesta_sync(proveedores, historial):
                     continue
 
                 return texto_resp, prov["nombre"]
+        except RateLimitError as e:
+            print(f"Aviso: {prov['nombre']} con límite de tasa ({e}). Reintentando tras 1.5s...")
+            time.sleep(1.5)
+            try:
+                res = prov["cliente"].chat.completions.create(
+                    model=prov["modelo"],
+                    messages=mensajes_para_enviar,
+                    temperature=prov.get("temperatura", 0.8),
+                    stream=False
+                )
+                if res.choices and res.choices[0].message.content:
+                    texto_resp = res.choices[0].message.content.strip()
+                    if not any(f in texto_resp.lower() for f in frases_censura):
+                        return texto_resp, prov["nombre"]
+            except Exception:
+                pass
+            continue
         except Exception as e:
             print(f"Aviso: {prov['nombre']} falló: {e}. Probando siguiente proveedor...")
             continue

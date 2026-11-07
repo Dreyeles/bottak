@@ -90,6 +90,12 @@ def inicializar_proveedores():
             "temperatura": 0.8
         })
         proveedores.append({
+            "nombre": "Groq Cloud (GPT OSS 20B)",
+            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "modelo": "openai/gpt-oss-20b",
+            "temperatura": 0.8
+        })
+        proveedores.append({
             "nombre": "Groq Cloud (Qwen 27B Respaldo)",
             "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
             "modelo": "qwen/qwen3.8-27b",
