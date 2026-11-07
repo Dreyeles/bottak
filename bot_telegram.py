@@ -146,12 +146,19 @@ def inicializar_proveedores():
             "temperatura": 0.8
         })
 
-    # 3. Venice AI (Opcional)
+    # 3. Venice AI (Especializado en rol sin censura)
     if venice_key:
+        cliente_venice = OpenAI(api_key=venice_key, base_url="https://api.venice.ai/api/v1")
         proveedores.append({
-            "nombre": "Venice AI",
-            "cliente": OpenAI(api_key=venice_key, base_url="https://api.venice.ai/api/v1"),
-            "modelo": "llama-3.3-70b",
+            "nombre": "Venice AI (Role Play Uncensored)",
+            "cliente": cliente_venice,
+            "modelo": "venice-uncensored-role-play",
+            "temperatura": 0.8
+        })
+        proveedores.append({
+            "nombre": "Venice AI (Uncensored 1.2)",
+            "cliente": cliente_venice,
+            "modelo": "venice-uncensored-1-2",
             "temperatura": 0.8
         })
 
