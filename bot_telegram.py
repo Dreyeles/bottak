@@ -1,0 +1,626 @@
+"""
+=============================================================================
+BOT DE TELEGRAM PARA ROL CON IA MULTI-API (FAILOVER)
+=============================================================================
+Permite jugar partidas de rol interactivas a través de Telegram con personajes
+de IA intercambiables, creación de personajes personalizados con contexto
+y sistema de respaldo automático entre Groq y OpenRouter.
+=============================================================================
+"""
+
+import os
+import sys
+import json
+import warnings
+import asyncio
+
+# Forzar flush de salida para ver logs de inmediato
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+warnings.filterwarnings("ignore", category=UserWarning, module="telegram")
+from io import BytesIO
+from datetime import datetime
+from dotenv import load_dotenv
+
+from openai import OpenAI, RateLimitError, APIConnectionError, APIError, AuthenticationError, NotFoundError
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    constants
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters
+)
+
+# Cargar variables de entorno
+DIRECTORIO_ACTUAL = os.path.dirname(os.path.abspath(__file__))
+RUTA_ENV = os.path.join(DIRECTORIO_ACTUAL, ".env")
+load_dotenv(RUTA_ENV)
+
+CARPETA_PERSONAJES = os.path.join(DIRECTORIO_ACTUAL, "personajes")
+CARPETA_HISTORIALES = os.path.join(DIRECTORIO_ACTUAL, "historiales")
+os.makedirs(CARPETA_PERSONAJES, exist_ok=True)
+os.makedirs(CARPETA_HISTORIALES, exist_ok=True)
+
+MAX_MENSAJES_CONTEXTO = 24
+
+# Estados para la conversación interactiva de crear personaje
+ESTADO_NOMBRE, ESTADO_TITULO, ESTADO_CONTEXTO, ESTADO_SALUDO = range(4)
+
+# Diccionario en memoria para las sesiones activas por chat_id
+sesiones_usuarios = {}
+
+
+def inicializar_proveedores():
+    """Configura los proveedores de IA en orden de prioridad."""
+    proveedores = []
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    venice_key = os.getenv("VENICE_API_KEY", "").strip()
+
+    # 1. Groq Cloud (Ultra rápido)
+    if groq_key:
+        proveedores.append({
+            "nombre": "Groq Cloud (GPT OSS 120B)",
+            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "modelo": "openai/gpt-oss-120b",
+            "temperatura": 0.8
+        })
+        proveedores.append({
+            "nombre": "Groq Cloud (Qwen 27B)",
+            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "modelo": "qwen/qwen3.8-27b",
+            "temperatura": 0.8
+        })
+
+    # 2. OpenRouter (Modelos gratuitos)
+    if openrouter_key:
+        cliente_openrouter = OpenAI(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://github.com/bot-rol", "X-Title": "Bot Rol Telegram"}
+        )
+        proveedores.append({
+            "nombre": "OpenRouter (Nemotron 550B)",
+            "cliente": cliente_openrouter,
+            "modelo": "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "temperatura": 0.8
+        })
+        proveedores.append({
+            "nombre": "OpenRouter (Nemotron Lightning)",
+            "cliente": cliente_openrouter,
+            "modelo": "nvidia/nemotron-3.5-lightning:free",
+            "temperatura": 0.8
+        })
+
+    # 3. Venice AI (Opcional)
+    if venice_key:
+        proveedores.append({
+            "nombre": "Venice AI",
+            "cliente": OpenAI(api_key=venice_key, base_url="https://api.venice.ai/api/v1"),
+            "modelo": "llama-3.3-70b",
+            "temperatura": 0.8
+        })
+
+    return proveedores
+
+
+def cargar_personajes():
+    """Carga los archivos JSON de la carpeta personajes/."""
+    personajes = []
+    if not os.path.exists(CARPETA_PERSONAJES):
+        return personajes
+
+    for archivo in sorted(os.listdir(CARPETA_PERSONAJES)):
+        if archivo.endswith(".json"):
+            ruta = os.path.join(CARPETA_PERSONAJES, archivo)
+            try:
+                with open(ruta, "r", encoding="utf-8") as f:
+                    datos = json.load(f)
+                    datos["_archivo"] = archivo
+                    if isinstance(datos.get("system_prompt"), list):
+                        datos["system_prompt"] = "\n".join(datos["system_prompt"])
+                    if isinstance(datos.get("saludo_inicial"), list):
+                        datos["saludo_inicial"] = "\n".join(datos["saludo_inicial"])
+                    personajes.append(datos)
+            except Exception as e:
+                print(f"Error cargando {archivo}: {e}")
+    return personajes
+
+
+def _generar_respuesta_sync(proveedores, historial):
+    """Llamada síncrona a las APIs con failover (ejecutada en hilo secundario)."""
+    if len(historial) > MAX_MENSAJES_CONTEXTO:
+        mensajes_para_enviar = [historial[0]] + historial[-(MAX_MENSAJES_CONTEXTO - 1):]
+    else:
+        mensajes_para_enviar = historial
+
+    for prov in proveedores:
+        try:
+            res = prov["cliente"].chat.completions.create(
+                model=prov["modelo"],
+                messages=mensajes_para_enviar,
+                temperature=prov.get("temperatura", 0.8),
+                stream=False
+            )
+            if res.choices and res.choices[0].message.content:
+                return res.choices[0].message.content.strip(), prov["nombre"]
+        except Exception as e:
+            print(f"Aviso: {prov['nombre']} falló: {e}. Probando siguiente proveedor...")
+            continue
+
+    return None, None
+
+
+async def generar_respuesta_ia(proveedores, historial):
+    """Wrapper asíncrono para no bloquear el bot de Telegram."""
+    return await asyncio.to_thread(_generar_respuesta_sync, proveedores, historial)
+
+
+async def enviar_mensaje_seguro(bot, chat_id, texto):
+    """Intenta enviar el mensaje con formato Markdown; si falla por sintaxis, lo envía en texto plano."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=texto, parse_mode=constants.ParseMode.MARKDOWN)
+    except Exception:
+        await bot.send_message(chat_id=chat_id, text=texto)
+
+
+def teclado_personajes():
+    """Genera los botones con los personajes disponibles y el botón para crear uno nuevo."""
+    personajes = cargar_personajes()
+    botones = []
+    for p in personajes:
+        archivo = p.get("_archivo", "")
+        nombre = p.get("nombre", "Personaje")
+        genero = p.get("genero", "")
+        genero_corto = genero.split("/")[0].strip() if "/" in genero else genero
+        texto_boton = f"🎭 {nombre} ({genero_corto})"
+        botones.append([InlineKeyboardButton(texto_boton, callback_data=f"sel_{archivo}")])
+
+    # Botón destacado para crear personaje con contexto propio
+    botones.append([InlineKeyboardButton("✨ ➕ Crear nuevo personaje con contexto", callback_data="crear_nuevo_personaje")])
+    return InlineKeyboardMarkup(botones)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start: Da la bienvenida y muestra selector de personajes."""
+    user = update.effective_user
+    nombre_jugador = user.first_name or "Aventurero"
+
+    texto = (
+        f"👋 ¡Hola, *{nombre_jugador}*!\n\n"
+        "Bienvenido al **Bot de Rol con Inteligencia Artificial**.\n"
+        "Aquí puedes jugar partidas de rol conversacionales con personajes vivos y memorias persistentes.\n\n"
+        "🎭 *Elige con quién deseas jugar o crea uno nuevo a tu gusto:*"
+    )
+    await update.message.reply_text(texto, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=teclado_personajes())
+
+
+async def cmd_personajes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /personajes: Muestra la lista de personajes para cambiar o crear."""
+    await update.message.reply_text(
+        "🎭 *Selecciona un personaje o crea uno nuevo:*",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_markup=teclado_personajes()
+    )
+
+
+# =============================================================================
+# FLUJO INTERACTIVO: CREAR PERSONAJE CON CONTEXTO
+# =============================================================================
+
+async def iniciar_creacion_personaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 1: Inicia el asistente interactivo pidiendo el nombre."""
+    mensaje = (
+        "✨ **CREADOR DE PERSONAJES PERSONALIZADOS**\n"
+        "───────────────────────────────\n\n"
+        "1️⃣ **¿Cómo se llama tu nuevo personaje?**\n\n"
+        "_(Escribe el nombre aquí en el chat, o envía /cancelar para salir)_"
+    )
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(mensaje, parse_mode=constants.ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(mensaje, parse_mode=constants.ParseMode.MARKDOWN)
+
+    return ESTADO_NOMBRE
+
+
+async def recibir_nombre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 2: Recibe el nombre y pide el título o rol."""
+    nombre = update.message.text.strip()
+    if not nombre:
+        await update.message.reply_text("Por favor, escribe un nombre válido:")
+        return ESTADO_NOMBRE
+
+    context.user_data["nuevo_nombre"] = nombre
+
+    await update.message.reply_text(
+        f"Excelente, el personaje se llamará *{nombre}*.\n\n"
+        "2️⃣ **¿Cuál es su título, profesión o arquetipo?**\n"
+        "_(Ejemplos: Hechicera oscura, Cazarrecompensas espacial, Detective cínico, Tabernero enano)_",
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+    return ESTADO_TITULO
+
+
+async def recibir_titulo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 3: Recibe el título y pide el contexto/personalidad."""
+    titulo = update.message.text.strip()
+    context.user_data["nuevo_titulo"] = titulo or "Aventurero"
+
+    nombre = context.user_data.get("nuevo_nombre", "Personaje")
+
+    await update.message.reply_text(
+        f"Perfecto: *{nombre}*, _{titulo}_.\n\n"
+        "3️⃣ **Cuéntame su contexto, trasfondo y personalidad:**\n\n"
+        "Puedes incluir todo lo que quieras:\n"
+        "• Su pasado o secretos.\n"
+        "• Cómo habla (formal, sarcástico, tosco, poético).\n"
+        "• Su actitud hacia ti (hostil, servicial, desconfiado).\n"
+        "• El mundo donde se encuentran (cyberpunk, medieval, apocalipsis).\n\n"
+        "_(¡Sé tan detallado como gustes! Todo esto se grabará en la memoria del bot)_",
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+    return ESTADO_CONTEXTO
+
+
+async def recibir_contexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 4: Recibe el contexto y pide el saludo inicial."""
+    contexto = update.message.text.strip()
+    context.user_data["nuevo_contexto"] = contexto
+
+    nombre = context.user_data.get("nuevo_nombre", "Personaje")
+
+    await update.message.reply_text(
+        "4️⃣ **¿Cuál será su saludo o escena inicial?**\n\n"
+        "Describe cómo empieza la partida usando asteriscos para las acciones. Ejemplo:\n"
+        f"`*{nombre} te mira de reojo mientras recarga su arma.* —Llegas justo a tiempo.`\n\n"
+        "👉 _(O simplemente escribe **`auto`** para que la IA genere un saludo inicial épico automáticamente)_",
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+    return ESTADO_SALUDO
+
+
+async def recibir_saludo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paso 5: Guarda el personaje en personajes/*.json e inicia la partida inmediatamente."""
+    saludo_input = update.message.text.strip()
+    nombre = context.user_data.get("nuevo_nombre", "Personaje")
+    titulo = context.user_data.get("nuevo_titulo", "Aventurero")
+    contexto = context.user_data.get("nuevo_contexto", "Personaje de rol.")
+
+    if saludo_input.lower() in ["auto", "automático", "automatico"]:
+        saludo = f"*{nombre} se detiene al notar tu presencia, evaluándote de arriba abajo con mirada atenta.* —Dime a qué has venido."
+    else:
+        saludo = saludo_input
+
+    # Crear system prompt completo
+    system_prompt = (
+        f"Eres {nombre}, {titulo}.\n"
+        f"Contexto, personalidad y trasfondo: {contexto}.\n"
+        "Mantén siempre el rol al 100%. Describe tus acciones, lenguaje corporal y entorno entre asteriscos (*así*), "
+        "y tus palabras habladas con guiones largos o comillas directas. Reacciona dinámicamente al jugador."
+    )
+
+    # Guardar en archivo JSON permanente
+    slug = "".join(c for c in nombre.lower() if c.isalnum() or c == '_').strip() or "personaje"
+    ruta_p = os.path.join(CARPETA_PERSONAJES, f"{slug}.json")
+    contador = 1
+    while os.path.exists(ruta_p):
+        ruta_p = os.path.join(CARPETA_PERSONAJES, f"{slug}_{contador}.json")
+        contador += 1
+
+    datos_nuevo = {
+        "nombre": nombre,
+        "titulo": titulo,
+        "genero": "Personalizado",
+        "saludo_inicial": saludo,
+        "system_prompt": system_prompt,
+        "_archivo": os.path.basename(ruta_p)
+    }
+
+    try:
+        with open(ruta_p, "w", encoding="utf-8") as f:
+            json.dump(datos_nuevo, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error al guardar personaje en disco: {e}")
+
+    # Iniciar la sesión de juego inmediatamente para este usuario
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    nombre_jugador = user.first_name or "Aventurero"
+
+    prompt_con_jugador = (
+        f"{system_prompt}\n"
+        f"El usuario interactúa contigo a través de Telegram bajo el nombre o personaje de '{nombre_jugador}'."
+    )
+
+    sesiones_usuarios[chat_id] = {
+        "personaje": datos_nuevo,
+        "nombre_jugador": nombre_jugador,
+        "historial": [
+            {"role": "system", "content": prompt_con_jugador},
+            {"role": "assistant", "content": saludo}
+        ]
+    }
+
+    mensaje_exito = (
+        f"🎉 **¡PERSONAJE CREADO Y GUARDADO!**\n"
+        f"*{nombre}* ahora forma parte de tu catálogo permanente.\n"
+        f"────────────────────────\n\n"
+        f"⚔️ **Iniciando escena con {nombre.upper()} ({titulo}):**\n\n"
+        f"{saludo}\n\n"
+        f"💬 *Escribe tu mensaje para responderle.*"
+    )
+    await update.message.reply_text(mensaje_exito, parse_mode=constants.ParseMode.MARKDOWN)
+
+    # Limpiar datos temporales
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancelar_creacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancela la creación del personaje."""
+    context.user_data.clear()
+    await update.message.reply_text(
+        "❌ Creación de personaje cancelada. Usa /personajes cuando desees elegir uno existente.",
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+    return ConversationHandler.END
+
+
+# =============================================================================
+# MANEJO DE SELECCIÓN Y PARTIDA
+# =============================================================================
+
+async def callback_personaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja el clic en los botones de selección de personaje predefinido."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("sel_"):
+        return
+
+    archivo = data.replace("sel_", "")
+    ruta = os.path.join(CARPETA_PERSONAJES, archivo)
+
+    if not os.path.exists(ruta):
+        await query.edit_message_text("❌ Personaje no encontrado.")
+        return
+
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            datos_p = json.load(f)
+    except Exception as e:
+        await query.edit_message_text(f"❌ Error al cargar personaje: {e}")
+        return
+
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    nombre_jugador = user.first_name or "Aventurero"
+
+    nombre = datos_p.get("nombre", "Personaje")
+    titulo = datos_p.get("titulo", "")
+    genero = datos_p.get("genero", "")
+    saludo = datos_p.get("saludo_inicial", f"*{nombre} te observa en silencio.*")
+    prompt_base = datos_p.get("system_prompt", f"Eres {nombre}. Mantén siempre el rol.")
+
+    prompt_completo = (
+        f"{prompt_base}\n"
+        f"El usuario interactúa contigo a través de Telegram bajo el nombre o personaje de '{nombre_jugador}'."
+    )
+
+    # Iniciar la sesión del usuario
+    sesiones_usuarios[chat_id] = {
+        "personaje": datos_p,
+        "nombre_jugador": nombre_jugador,
+        "historial": [
+            {"role": "system", "content": prompt_completo},
+            {"role": "assistant", "content": saludo}
+        ]
+    }
+
+    mensaje_inicio = (
+        f"⚔️ *Escenario iniciado con: {nombre.upper()}*\n"
+        f"_{titulo} ({genero})_\n"
+        f"────────────────────────\n\n"
+        f"{saludo}\n\n"
+        f"💡 *Escribe tu mensaje o acción para responder.* (Usa /ayuda para ver comandos)"
+    )
+
+    await query.edit_message_text(mensaje_inicio, parse_mode=constants.ParseMode.MARKDOWN)
+
+
+async def cmd_limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /limpiar: Reinicia la partida actual desde el saludo inicial."""
+    chat_id = update.effective_chat.id
+    if chat_id not in sesiones_usuarios:
+        await update.message.reply_text("ℹ️ No tienes ninguna partida activa. Usa /personajes para elegir uno.")
+        return
+
+    sesion = sesiones_usuarios[chat_id]
+    datos_p = sesion["personaje"]
+    nombre = datos_p.get("nombre", "Personaje")
+    saludo = datos_p.get("saludo_inicial", f"*{nombre} te observa en silencio.*")
+    system_prompt = sesion["historial"][0]["content"]
+
+    sesion["historial"] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "assistant", "content": saludo}
+    ]
+
+    await update.message.reply_text(
+        f"🔄 *Partida reiniciada con {nombre}*\n\n{saludo}",
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+
+
+async def cmd_guardar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /guardar: Guarda la partida y envía el archivo .txt directamente a Telegram."""
+    chat_id = update.effective_chat.id
+    if chat_id not in sesiones_usuarios or len(sesiones_usuarios[chat_id]["historial"]) <= 1:
+        await update.message.reply_text("ℹ️ No hay suficiente conversación en esta partida para guardar.")
+        return
+
+    sesion = sesiones_usuarios[chat_id]
+    nombre_p = sesion["personaje"].get("nombre", "Personaje")
+    nombre_j = sesion["nombre_jugador"]
+    historial = sesion["historial"]
+
+    # Crear contenido en memoria
+    buffer = BytesIO()
+    lineas = [
+        f"=== SESIÓN DE ROL CON {nombre_p.upper()} (TELEGRAM) ===\n",
+        f"Jugador: {nombre_j}\n",
+        f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n\n"
+    ]
+    for msg in historial:
+        rol = msg.get("role", "")
+        contenido = msg.get("content", "")
+        if rol == "system":
+            continue
+        etiqueta = nombre_j if rol == "user" else nombre_p
+        lineas.append(f"[{etiqueta.upper()}]:\n{contenido}\n\n")
+
+    buffer.write("".join(lineas).encode("utf-8"))
+    buffer.seek(0)
+
+    nombre_archivo = f"rol_{nombre_p.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    await update.message.reply_document(
+        document=buffer,
+        filename=nombre_archivo,
+        caption=f"📜 ¡Aquí tienes el historial completo de tu partida con *{nombre_p}*!",
+        parse_mode=constants.ParseMode.MARKDOWN
+    )
+
+
+async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /ayuda: Muestra los comandos disponibles."""
+    texto = (
+        "📖 *Comandos del Bot de Rol:*\n\n"
+        "• /personajes - Ver catálogo y crear personajes nuevos.\n"
+        "• /crear - Iniciar el asistente para crear un personaje con contexto.\n"
+        "• /limpiar - Reiniciar la escena actual desde cero.\n"
+        "• /guardar - Descargar la transcripción de la partida en archivo .txt.\n"
+        "• /ayuda - Muestra esta ayuda.\n\n"
+        "💡 *Consejo de rol:* Usa asteriscos para describir tus acciones (ej: `*desenvaino mi espada* ¿quién eres?`)."
+    )
+    await update.message.reply_text(texto, parse_mode=constants.ParseMode.MARKDOWN)
+
+
+async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja las entradas de texto del usuario durante el juego."""
+    chat_id = update.effective_chat.id
+    texto_usuario = update.message.text.strip()
+
+    if not texto_usuario:
+        return
+
+    # Si no tiene personaje elegido, invitarle a elegir o crear uno
+    if chat_id not in sesiones_usuarios:
+        await update.message.reply_text(
+            "👋 Primero debes elegir o crear un personaje con el que quieras jugar:",
+            reply_markup=teclado_personajes()
+        )
+        return
+
+    sesion = sesiones_usuarios[chat_id]
+    nombre_p = sesion["personaje"].get("nombre", "Personaje")
+    proveedores = context.bot_data.get("proveedores", [])
+
+    if not proveedores:
+        await update.message.reply_text("⚠️ No hay proveedores de IA configurados en el servidor.")
+        return
+
+    # Agregar mensaje del usuario al historial
+    sesion["historial"].append({"role": "user", "content": texto_usuario})
+
+    # Mostrar acción de 'escribiendo...' mientras la IA procesa
+    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+
+    # Generar respuesta con failover
+    respuesta, prov_usado = await generar_respuesta_ia(proveedores, sesion["historial"])
+
+    if respuesta:
+        sesion["historial"].append({"role": "assistant", "content": respuesta})
+        await enviar_mensaje_seguro(context.bot, chat_id, respuesta)
+    else:
+        # Revertir el último mensaje si todas las APIs fallaron
+        sesion["historial"].pop()
+        await update.message.reply_text(
+            "⚠️ Lo siento, los servicios de IA están temporalmente saturados. Intenta enviar tu mensaje de nuevo en unos segundos."
+        )
+
+
+def main():
+    token_telegram = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+    if not token_telegram:
+        print("\n❌ Error: No se encontró TELEGRAM_BOT_TOKEN en el archivo .env")
+        print("Obtén tu token hablando con @BotFather en Telegram y pégalo en el archivo .env")
+        return
+
+    proveedores = inicializar_proveedores()
+    if not proveedores:
+        print("\n❌ Error: No se encontraron claves de IA (Groq u OpenRouter) en el archivo .env")
+        return
+
+    print("=" * 60)
+    print("🚀 INICIANDO BOT DE TELEGRAM (ROL MULTI-API)")
+    print("=" * 60)
+    print(f"✔ Proveedores de IA activos: {len(proveedores)}")
+    for p in proveedores:
+        print(f"  - {p['nombre']} ({p['modelo']})")
+
+    # Construir la aplicación de Telegram
+    app = ApplicationBuilder().token(token_telegram).build()
+
+    # Guardar proveedores en bot_data para acceso global
+    app.bot_data["proveedores"] = proveedores
+
+    # Conversación interactiva para crear personajes con contexto
+    conv_crear_personaje = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(iniciar_creacion_personaje, pattern="^crear_nuevo_personaje$"),
+            CommandHandler("crear", iniciar_creacion_personaje)
+        ],
+        states={
+            ESTADO_NOMBRE: [MessageHandler(filters.TEXT & (~filters.COMMAND), recibir_nombre)],
+            ESTADO_TITULO: [MessageHandler(filters.TEXT & (~filters.COMMAND), recibir_titulo)],
+            ESTADO_CONTEXTO: [MessageHandler(filters.TEXT & (~filters.COMMAND), recibir_contexto)],
+            ESTADO_SALUDO: [MessageHandler(filters.TEXT & (~filters.COMMAND), recibir_saludo)]
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar_creacion)],
+        per_chat=True,
+        per_user=True,
+        per_message=False
+    )
+
+    # Handlers
+    app.add_handler(conv_crear_personaje)
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("personajes", cmd_personajes))
+    app.add_handler(CommandHandler("limpiar", cmd_limpiar))
+    app.add_handler(CommandHandler("guardar", cmd_guardar))
+    app.add_handler(CommandHandler("ayuda", cmd_ayuda))
+    app.add_handler(CallbackQueryHandler(callback_personaje))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), manejar_mensaje_usuario))
+
+    print("\n✔ Bot conectado a Telegram con éxito.")
+    print("👉 Abre Telegram, busca tu bot y envía /start para comenzar a jugar.\n")
+    print("Presiona Ctrl + C en esta terminal para detener el bot.")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
