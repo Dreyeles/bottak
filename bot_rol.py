@@ -145,6 +145,18 @@ def listar_personajes():
                         datos["system_prompt"] = "\n".join(datos["system_prompt"])
                     if isinstance(datos.get("saludo_inicial"), list):
                         datos["saludo_inicial"] = "\n".join(datos["saludo_inicial"])
+
+                    # Cargar archivo de contexto en Markdown complementario si existe
+                    ruta_ctx_md = os.path.join(CARPETA_PERSONAJES, archivo.replace(".json", "_contexto.md"))
+                    if os.path.exists(ruta_ctx_md):
+                        try:
+                            with open(ruta_ctx_md, "r", encoding="utf-8") as f_ctx:
+                                texto_ctx = f_ctx.read().strip()
+                                if texto_ctx:
+                                    datos["system_prompt"] += f"\n\n=== CONTEXTO DETALLADO Y RECUERDOS (MARKDOWN) ===\n{texto_ctx}"
+                        except Exception as e_ctx:
+                            print(f"{Fore.RED}Aviso leyendo contexto .md de {archivo}: {e_ctx}")
+
                     personajes.append(datos)
             except Exception as e:
                 print(f"{Fore.RED}Error al cargar {archivo}: {e}")

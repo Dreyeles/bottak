@@ -106,8 +106,26 @@ def extraer_recuerdos_con_ia(texto_chat, nombre_personaje):
 
 
 def insertar_contexto_en_personaje(datos_personaje, nuevo_bloque, etiqueta="Recuerdo / Chat"):
-    """Inserta el nuevo bloque de contexto en el system_prompt del personaje de forma limpia."""
+    """Inserta el nuevo bloque de contexto en el archivo .md si existe, o en el JSON de forma limpia."""
     fecha_hoy = datetime.now().strftime("%d/%m/%Y %H:%M")
+    nombre_archivo_base = datos_personaje["_archivo"].replace(".json", "")
+    ruta_md = os.path.join(CARPETA_PERSONAJES, f"{nombre_archivo_base}_contexto.md")
+
+    # Si existe archivo Markdown complementario, guardamos directamente allí (Formato ideal)
+    if os.path.exists(ruta_md):
+        bloque_md = [
+            f"\n\n### 🗓️ {etiqueta} ({fecha_hoy})",
+        ]
+        for linea in nuevo_bloque.splitlines():
+            bloque_md.append(f"- {linea}" if not linea.startswith("-") and not linea.startswith("#") and linea.strip() else linea)
+
+        with open(ruta_md, "a", encoding="utf-8") as f_md:
+            f_md.write("\n".join(bloque_md) + "\n")
+
+        print(f"\n{Fore.GREEN}{Style.BRIGHT}✔ ¡Contexto añadido y guardado exitosamente en el archivo Markdown: {os.path.basename(ruta_md)}!")
+        return
+
+    # Si no existe .md, guardar en el JSON tradicional
     lineas_nuevas = [
         "",
         f"--- [{etiqueta.upper()} - {fecha_hoy}] ---"
@@ -119,14 +137,12 @@ def insertar_contexto_en_personaje(datos_personaje, nuevo_bloque, etiqueta="Recu
 
     # Si es lista de strings
     if isinstance(prompt, list):
-        # Buscar el delimitador de contexto
         indice_cierre = -1
         for i, l in enumerate(prompt):
             if "=====" in l and i > 5:
                 indice_cierre = i
 
         if indice_cierre != -1:
-            # Insertar justo antes del cierre
             for k, lin in enumerate(lineas_nuevas):
                 prompt.insert(indice_cierre + k, lin)
         else:
@@ -134,11 +150,9 @@ def insertar_contexto_en_personaje(datos_personaje, nuevo_bloque, etiqueta="Recu
 
         datos_personaje["system_prompt"] = prompt
 
-    # Si es un solo string
     elif isinstance(prompt, str):
         datos_personaje["system_prompt"] = prompt + "\n" + "\n".join(lineas_nuevas)
 
-    # Guardar en el archivo JSON
     ruta_archivo = os.path.join(CARPETA_PERSONAJES, datos_personaje["_archivo"])
     datos_guardar = {k: v for k, v in datos_personaje.items() if k != "_archivo"}
 
@@ -149,16 +163,26 @@ def insertar_contexto_en_personaje(datos_personaje, nuevo_bloque, etiqueta="Recu
 
 
 def ver_contexto_actual(datos_personaje):
-    """Muestra el contexto que tiene actualmente guardado el personaje."""
-    prompt = datos_personaje.get("system_prompt")
+    """Muestra el contexto que tiene actualmente guardado el personaje (tanto JSON como .md)."""
+    nombre_archivo_base = datos_personaje["_archivo"].replace(".json", "")
+    ruta_md = os.path.join(CARPETA_PERSONAJES, f"{nombre_archivo_base}_contexto.md")
+
     print(f"\n{Fore.CYAN}{Style.BRIGHT}==================================================")
     print(f"{Fore.YELLOW}{Style.BRIGHT}   CONTEXTO ACTUAL DE: {datos_personaje.get('nombre', '').upper()}")
     print(f"{Fore.CYAN}{Style.BRIGHT}==================================================")
-    if isinstance(prompt, list):
-        for linea in prompt:
-            print(f"{Fore.WHITE}{linea}")
+
+    if os.path.exists(ruta_md):
+        print(f"{Fore.GREEN}[Leído desde archivo Markdown: {os.path.basename(ruta_md)}]\n")
+        with open(ruta_md, "r", encoding="utf-8") as f_md:
+            print(f"{Fore.WHITE}{f_md.read()}")
     else:
-        print(f"{Fore.WHITE}{prompt}")
+        prompt = datos_personaje.get("system_prompt")
+        if isinstance(prompt, list):
+            for linea in prompt:
+                print(f"{Fore.WHITE}{linea}")
+        else:
+            print(f"{Fore.WHITE}{prompt}")
+
     print(f"{Fore.CYAN}{Style.BRIGHT}==================================================\n")
 
 
