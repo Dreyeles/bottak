@@ -23,12 +23,23 @@ warnings.filterwarnings("ignore", category=UserWarning, module="telegram")
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Servidor web ultraligero para que plataformas en la nube (como Render) sepan que el bot está vivo."""
+    """Servidor web ultraligero para que plataformas en la nube (como Render) y monitores (como UptimeRobot) sepan que el bot está vivo."""
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"Bot de Rol Telegram activo y funcionando.")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
         pass  # Silenciar logs del servidor web para no ensuciar la consola
@@ -201,7 +212,25 @@ def _generar_respuesta_sync(proveedores, historial):
                 stream=False
             )
             if res.choices and res.choices[0].message.content:
-                return res.choices[0].message.content.strip(), prov["nombre"]
+                texto_resp = res.choices[0].message.content.strip()
+                # Detectar y filtrar negativas o censura de IA para activar failover
+                frases_censura = [
+                    "no puedo ayudarte con eso",
+                    "no puedo ayudarte con esta",
+                    "no puedo cumplir con",
+                    "como modelo de lenguaje",
+                    "como inteligencia artificial",
+                    "i cannot assist with that",
+                    "i cannot fulfill this",
+                    "lo siento, pero no puedo",
+                    "no me siento cómoda",
+                    "no estoy programada para"
+                ]
+                if any(f in texto_resp.lower() for f in frases_censura):
+                    print(f"Aviso: {prov['nombre']} emitió negativa de censura ('{texto_resp[:50]}...'). Saltando al siguiente proveedor...")
+                    continue
+
+                return texto_resp, prov["nombre"]
         except Exception as e:
             print(f"Aviso: {prov['nombre']} falló: {e}. Probando siguiente proveedor...")
             continue
