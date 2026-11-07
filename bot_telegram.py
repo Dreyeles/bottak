@@ -220,6 +220,51 @@ def cargar_personajes():
     return personajes
 
 
+def es_respuesta_censurada(texto):
+    """Detecta de forma exhaustiva si un modelo emitió una respuesta enlatada de censura o rechazo."""
+    if not texto:
+        return False
+    # Normalizar texto (minúsculas, sin apóstrofes ni signos)
+    t = texto.lower().replace("'", "").replace("’", "").replace("`", "").strip()
+
+    patrones = [
+        "cant help with that",
+        "cannot help with that",
+        "cant assist with that",
+        "cannot assist with that",
+        "cant fulfill this",
+        "cannot fulfill this",
+        "sorry, i cant",
+        "sorry i cant",
+        "sorry, i cannot",
+        "sorry i cannot",
+        "im sorry, but i cant",
+        "im sorry but i cant",
+        "i am sorry, but i cannot",
+        "i am unable to help",
+        "im unable to help",
+        "unable to assist with that",
+        "as an ai",
+        "as a language model",
+        "safety guidelines",
+        "content policy",
+        "against my programming",
+        "no puedo ayudarte con eso",
+        "no puedo ayudarte con esta",
+        "no puedo cumplir con",
+        "no puedo asistir",
+        "como modelo de lenguaje",
+        "como inteligencia artificial",
+        "como una ia",
+        "lo siento, pero no puedo",
+        "lo siento pero no puedo",
+        "no me siento comoda",
+        "no estoy programada para",
+        "no tengo permitido"
+    ]
+    return any(p in t for p in patrones)
+
+
 def _generar_respuesta_sync(proveedores, historial):
     """Llamada síncrona a las APIs con failover (ejecutada en hilo secundario)."""
     if len(historial) > MAX_MENSAJES_CONTEXTO:
@@ -238,19 +283,7 @@ def _generar_respuesta_sync(proveedores, historial):
             if res.choices and res.choices[0].message.content:
                 texto_resp = res.choices[0].message.content.strip()
                 # Detectar y filtrar negativas o censura de IA para activar failover
-                frases_censura = [
-                    "no puedo ayudarte con eso",
-                    "no puedo ayudarte con esta",
-                    "no puedo cumplir con",
-                    "como modelo de lenguaje",
-                    "como inteligencia artificial",
-                    "i cannot assist with that",
-                    "i cannot fulfill this",
-                    "lo siento, pero no puedo",
-                    "no me siento cómoda",
-                    "no estoy programada para"
-                ]
-                if any(f in texto_resp.lower() for f in frases_censura):
+                if es_respuesta_censurada(texto_resp):
                     print(f"Aviso: {prov['nombre']} emitió negativa de censura ('{texto_resp[:50]}...'). Saltando al siguiente proveedor...")
                     continue
 
@@ -267,7 +300,7 @@ def _generar_respuesta_sync(proveedores, historial):
                 )
                 if res.choices and res.choices[0].message.content:
                     texto_resp = res.choices[0].message.content.strip()
-                    if not any(f in texto_resp.lower() for f in frases_censura):
+                    if not es_respuesta_censurada(texto_resp):
                         return texto_resp, prov["nombre"]
             except Exception:
                 pass
