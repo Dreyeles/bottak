@@ -99,29 +99,36 @@ sesiones_usuarios = {}
 
 
 def inicializar_proveedores():
-    """Configura los proveedores de IA en orden de prioridad."""
+    """Configura los proveedores de IA en orden de prioridad con soporte multi-cuenta."""
     proveedores = []
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    groq_keys = [
+        k.strip() for k in [
+            os.getenv("GROQ_API_KEY", ""),
+            os.getenv("GROQ_API_KEY_2", "")
+        ] if k.strip()
+    ]
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     venice_key = os.getenv("VENICE_API_KEY", "").strip()
 
-    # 1. Groq Cloud (Ultra rápido)
-    if groq_key:
+    # 1. Groq Cloud (Ultra rápido - Soporta múltiples cuentas para doble cuota)
+    for idx, g_key in enumerate(groq_keys, start=1):
+        sufijo = f" (Cuenta {idx})" if len(groq_keys) > 1 else ""
+        cliente_groq = OpenAI(api_key=g_key, base_url="https://api.groq.com/openai/v1")
         proveedores.append({
-            "nombre": "Groq Cloud (GPT OSS 120B)",
-            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "nombre": f"Groq{sufijo} (GPT OSS 120B)",
+            "cliente": cliente_groq,
             "modelo": "openai/gpt-oss-120b",
             "temperatura": 0.8
         })
         proveedores.append({
-            "nombre": "Groq Cloud (GPT OSS 20B)",
-            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "nombre": f"Groq{sufijo} (GPT OSS 20B)",
+            "cliente": cliente_groq,
             "modelo": "openai/gpt-oss-20b",
             "temperatura": 0.8
         })
         proveedores.append({
-            "nombre": "Groq Cloud (Qwen 27B)",
-            "cliente": OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1"),
+            "nombre": f"Groq{sufijo} (Qwen 27B)",
+            "cliente": cliente_groq,
             "modelo": "qwen/qwen3.8-27b",
             "temperatura": 0.8
         })
