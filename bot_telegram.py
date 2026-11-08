@@ -278,7 +278,8 @@ def _generar_respuesta_sync(proveedores, historial):
                 model=prov["modelo"],
                 messages=mensajes_para_enviar,
                 temperature=prov.get("temperatura", 0.8),
-                stream=False
+                stream=False,
+                timeout=15.0
             )
             if res.choices and res.choices[0].message.content:
                 texto_resp = res.choices[0].message.content.strip()
@@ -296,7 +297,8 @@ def _generar_respuesta_sync(proveedores, historial):
                     model=prov["modelo"],
                     messages=mensajes_para_enviar,
                     temperature=prov.get("temperatura", 0.8),
-                    stream=False
+                    stream=False,
+                    timeout=15.0
                 )
                 if res.choices and res.choices[0].message.content:
                     texto_resp = res.choices[0].message.content.strip()
@@ -701,11 +703,23 @@ async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_
     # Agregar mensaje del usuario al historial
     sesion["historial"].append({"role": "user", "content": texto_usuario})
 
-    # Mostrar acción de 'escribiendo...' mientras la IA procesa
-    await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+    # Tarea en segundo plano para mantener la acción 'escribiendo...' en Telegram mientras la IA genera
+    async def mantener_indicador_escribiendo():
+        while True:
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
+                await asyncio.sleep(4)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                break
 
-    # Generar respuesta con failover
-    respuesta, prov_usado = await generar_respuesta_ia(proveedores, sesion["historial"])
+    tarea_escribiendo = asyncio.create_task(mantener_indicador_escribiendo())
+    try:
+        # Generar respuesta con failover
+        respuesta, prov_usado = await generar_respuesta_ia(proveedores, sesion["historial"])
+    finally:
+        tarea_escribiendo.cancel()
 
     if respuesta:
         sesion["historial"].append({"role": "assistant", "content": respuesta})
