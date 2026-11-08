@@ -10,6 +10,7 @@ y sistema de respaldo automático entre Groq y OpenRouter.
 
 import os
 import sys
+import re
 import json
 import time
 import warnings
@@ -308,6 +309,26 @@ def es_respuesta_censurada(texto):
     return any(p in t for p in patrones)
 
 
+def limpiar_texto_respuesta(texto):
+    """Limpia etiquetas think, reflexiones meta en inglés y monólogos internos entre paréntesis."""
+    if not texto:
+        return ""
+    # 1. Eliminar etiquetas <think>...</think>
+    t = re.sub(r"<think>.*?</think>", "", texto, flags=re.DOTALL)
+    # 2. Eliminar pensamientos en inglés entre paréntesis (monólogo interno o deliberación de reglas)
+    t = re.sub(r"\([^)]*?(?:emoticon|emoji|graphic|rule|allow|can\'t|cannot|let\'s|we must|think|actually)[^)]*?\)", "\n", t, flags=re.IGNORECASE | re.DOTALL)
+    # 3. Eliminar bloques de reflexión que empiecen con conectores típicos en inglés
+    t = re.sub(r"\((?:But|Wait|Actually|Let\'s|Note|I should|Can\'t|We must|Thinking)[^)]*?\)", "\n", t, flags=re.IGNORECASE | re.DOTALL)
+
+    t = t.strip()
+    lineas = [l.strip() for l in t.splitlines() if l.strip()]
+    if len(lineas) >= 2 and len(lineas[0]) > 8 and len(lineas[-1]) > 8:
+        if lineas[0][:12].lower() == lineas[-1][:12].lower():
+            t = lineas[-1]
+
+    return t.strip()
+
+
 def _generar_respuesta_sync(proveedores, historial):
     """Llamada síncrona a las APIs con failover (ejecutada en hilo secundario)."""
     if len(historial) > MAX_MENSAJES_CONTEXTO:
@@ -331,7 +352,9 @@ def _generar_respuesta_sync(proveedores, historial):
                     print(f"Aviso: {prov['nombre']} emitió negativa de censura ('{texto_resp[:50]}...'). Saltando al siguiente proveedor...")
                     continue
 
-                return texto_resp, prov["nombre"]
+                texto_limpio = limpiar_texto_respuesta(texto_resp)
+                if texto_limpio:
+                    return texto_limpio, prov["nombre"]
         except RateLimitError as e:
             print(f"Aviso: {prov['nombre']} con límite de tasa ({e}). Reintentando tras 1.5s...")
             time.sleep(1.5)
@@ -346,7 +369,9 @@ def _generar_respuesta_sync(proveedores, historial):
                 if res.choices and res.choices[0].message.content:
                     texto_resp = res.choices[0].message.content.strip()
                     if not es_respuesta_censurada(texto_resp):
-                        return texto_resp, prov["nombre"]
+                        texto_limpio = limpiar_texto_respuesta(texto_resp)
+                        if texto_limpio:
+                            return texto_limpio, prov["nombre"]
             except Exception:
                 pass
             continue
