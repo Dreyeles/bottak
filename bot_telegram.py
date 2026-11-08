@@ -96,6 +96,49 @@ ESTADO_NOMBRE, ESTADO_TITULO, ESTADO_CONTEXTO, ESTADO_SALUDO = range(4)
 
 # Diccionario en memoria para las sesiones activas por chat_id
 sesiones_usuarios = {}
+ARCHIVO_SESIONES = os.path.join(CARPETA_HISTORIALES, "sesiones_activas.json")
+
+
+def guardar_sesiones_disco():
+    """Persiste las sesiones activas en disco para sobrevivir a reinicios del servidor."""
+    try:
+        datos = {}
+        for c_id, s in sesiones_usuarios.items():
+            datos[str(c_id)] = {
+                "personaje_archivo": s["personaje"].get("_archivo", "ada_liz.json"),
+                "nombre_jugador": s.get("nombre_jugador", "Drey"),
+                "historial": s.get("historial", [])
+            }
+        with open(ARCHIVO_SESIONES, "w", encoding="utf-8") as f:
+            json.dump(datos, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Aviso guardando sesiones en disco: {e}")
+
+
+def cargar_sesiones_disco():
+    """Restaura las sesiones activas desde el disco."""
+    global sesiones_usuarios
+    if not os.path.exists(ARCHIVO_SESIONES):
+        return
+    try:
+        with open(ARCHIVO_SESIONES, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        for c_id_str, s_data in datos.items():
+            try:
+                c_id = int(c_id_str)
+                archivo_p = s_data.get("personaje_archivo", "ada_liz.json")
+                p = cargar_personaje_completo(archivo_p)
+                if p:
+                    sesiones_usuarios[c_id] = {
+                        "personaje": p,
+                        "nombre_jugador": s_data.get("nombre_jugador", "Drey"),
+                        "historial": s_data.get("historial", [])
+                    }
+            except Exception:
+                pass
+        print(f"✔ {len(sesiones_usuarios)} sesión(es) restaurada(s) desde el disco.")
+    except Exception as e:
+        print(f"Aviso restaurando sesiones desde disco: {e}")
 
 
 def inicializar_proveedores():
@@ -575,6 +618,7 @@ async def callback_personaje(update: Update, context: ContextTypes.DEFAULT_TYPE)
             {"role": "assistant", "content": saludo}
         ]
     }
+    guardar_sesiones_disco()
 
     mensaje_inicio = (
         f"⚔️ *Escenario iniciado con: {nombre.upper()}*\n"
@@ -616,6 +660,7 @@ async def cmd_limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"role": "system", "content": system_prompt},
         {"role": "assistant", "content": saludo}
     ]
+    guardar_sesiones_disco()
 
     await update.message.reply_text(
         f"🔄 *Partida reiniciada con {nombre}*\n\n{saludo}",
@@ -684,13 +729,34 @@ async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_
     if not texto_usuario:
         return
 
-    # Si no tiene personaje elegido, invitarle a elegir o crear uno
+    # Si no tiene personaje en memoria, intentar cargar desde disco
     if chat_id not in sesiones_usuarios:
-        await update.message.reply_text(
-            "👋 Primero debes elegir o crear un personaje con el que quieras jugar:",
-            reply_markup=teclado_personajes()
-        )
-        return
+        cargar_sesiones_disco()
+
+    # Si aún así no tiene sesión activa, auto-iniciar con Ada Liz para no interrumpir al usuario
+    if chat_id not in sesiones_usuarios:
+        p_ada = cargar_personaje_completo("ada_liz.json")
+        if p_ada:
+            nombre_jugador = update.effective_user.first_name or "Drey"
+            prompt_completo = (
+                f"{p_ada['system_prompt']}\n"
+                f"El usuario interactúa contigo a través de WhatsApp/Telegram bajo el nombre de '{nombre_jugador}'."
+            )
+            sesiones_usuarios[chat_id] = {
+                "personaje": p_ada,
+                "nombre_jugador": nombre_jugador,
+                "historial": [
+                    {"role": "system", "content": prompt_completo},
+                    {"role": "assistant", "content": p_ada.get("saludo_inicial", "Holo :3")}
+                ]
+            }
+            guardar_sesiones_disco()
+        else:
+            await update.message.reply_text(
+                "👋 Primero debes elegir o crear un personaje con el que quieras jugar:",
+                reply_markup=teclado_personajes()
+            )
+            return
 
     sesion = sesiones_usuarios[chat_id]
     nombre_p = sesion["personaje"].get("nombre", "Personaje")
@@ -723,6 +789,7 @@ async def manejar_mensaje_usuario(update: Update, context: ContextTypes.DEFAULT_
 
     if respuesta:
         sesion["historial"].append({"role": "assistant", "content": respuesta})
+        guardar_sesiones_disco()
         await enviar_mensaje_seguro(context.bot, chat_id, respuesta)
     else:
         # Revertir el último mensaje si todas las APIs fallaron
@@ -790,6 +857,8 @@ def main():
     app.add_handler(CommandHandler("ayuda", cmd_ayuda))
     app.add_handler(CallbackQueryHandler(callback_personaje))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), manejar_mensaje_usuario))
+
+    cargar_sesiones_disco()
 
     print("\n✔ Bot conectado a Telegram con éxito.")
     print("👉 Abre Telegram, busca tu bot y envía /start para comenzar a jugar.\n")
